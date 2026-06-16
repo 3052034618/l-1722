@@ -4,12 +4,17 @@ const SeatLockService = require('../services/SeatLockService');
 const MemberService = require('../services/MemberService');
 const InventoryService = require('../services/InventoryService');
 const NotificationService = require('../services/NotificationService');
+const RefundService = require('../services/RefundService');
 const { Order, OrderItem, Schedule, Concession, Member, SeatLock } = require('../models');
 const { v4: uuidv4 } = require('uuid');
 
 router.post('/', async (req, res) => {
   try {
-    const { userId, scheduleId, seatIds, concessionItems = [], usePoints = false, pointsToUse = 0 } = req.body;
+    const { userId, scheduleId, seatIds, lockToken, concessionItems = [], usePoints = false, pointsToUse = 0 } = req.body;
+
+    if (!lockToken) {
+      return res.status(400).json({ code: 400, message: '缺少锁座凭证，请重新选座', data: null });
+    }
 
     if (!seatIds || seatIds.length === 0) {
       return res.status(400).json({ code: 400, message: '请选择座位', data: null });
@@ -28,27 +33,35 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ code: 400, message: '该场次已取消', data: null });
     }
 
-    const userActiveLocks = await SeatLockService.getUserActiveLocks(scheduleId, userId);
-    if (userActiveLocks.length === 0) {
-      return res.status(400).json({ code: 400, message: '您的座位锁定已过期，请重新选座', data: null });
+    const tokenLocks = await SeatLockService.getLocksByToken(lockToken);
+    if (tokenLocks.length === 0) {
+      return res.status(400).json({ code: 400, message: '锁座凭证无效，请重新选座', data: null });
     }
 
-    const userActiveSeatIds = userActiveLocks.map(l => l.seatId);
-
-    const extraSeatIds = uniqueSeatIds.filter(id => !userActiveSeatIds.includes(id));
-    if (extraSeatIds.length > 0) {
-      return res.status(400).json({
-        code: 400,
-        message: `座位 ${extraSeatIds.join(', ')} 未被您锁定或已过期，请重新选座`,
-        data: null
-      });
+    const wrongSchedule = tokenLocks.filter(l => l.scheduleId !== scheduleId);
+    if (wrongSchedule.length > 0) {
+      return res.status(400).json({ code: 400, message: '锁座凭证与场次不匹配', data: null });
     }
 
-    if (uniqueSeatIds.length !== userActiveLocks.length) {
+    const wrongUser = tokenLocks.filter(l => l.userId !== userId);
+    if (wrongUser.length > 0) {
+      return res.status(400).json({ code: 400, message: '锁座凭证与用户不匹配', data: null });
+    }
+
+    const now = new Date();
+    const expiredOrUsed = tokenLocks.filter(l => l.status !== 'locked' || new Date(l.expireAt) <= now);
+    if (expiredOrUsed.length > 0) {
+      return res.status(400).json({ code: 400, message: '锁座凭证已过期或已使用，请重新选座', data: null });
+    }
+
+    const tokenSeatIds = tokenLocks.map(l => l.seatId).sort((a, b) => a - b);
+    const submittedSeatIds = uniqueSeatIds.sort((a, b) => a - b);
+
+    if (tokenSeatIds.length !== submittedSeatIds.length || !tokenSeatIds.every((id, i) => id === submittedSeatIds[i])) {
       return res.status(400).json({
         code: 400,
-        message: `您锁定了 ${userActiveLocks.length} 个座位，但只提交了 ${uniqueSeatIds.length} 个，请一并结算所有锁定座位`,
-        data: { lockedCount: userActiveLocks.length, submittedCount: uniqueSeatIds.length }
+        message: `提交的座位与锁座凭证不一致，凭证锁定座位为 [${tokenSeatIds.join(', ')}]，请一并结算该凭证下所有座位`,
+        data: { tokenSeatIds, submittedSeatIds }
       });
     }
 
@@ -90,8 +103,8 @@ router.post('/', async (req, res) => {
 
     const payAmount = Math.max(discountedAmount - pointsDeduction, 0);
 
-    const confirmedLocks = await SeatLockService.confirmLocks(scheduleId, uniqueSeatIds, userId);
-    if (confirmedLocks.length !== uniqueSeatIds.length) {
+    const confirmedLocks = await SeatLockService.confirmLocksByToken(scheduleId, lockToken, userId);
+    if (confirmedLocks.length !== tokenLocks.length) {
       for (const lock of confirmedLocks) {
         await lock.update({ status: 'locked' });
       }
@@ -103,7 +116,7 @@ router.post('/', async (req, res) => {
     }
 
     const orderId = uuidv4();
-    const earliestExpireAt = userActiveLocks.reduce((min, l) => l.expireAt < min ? l.expireAt : min, userActiveLocks[0].expireAt);
+    const earliestExpireAt = tokenLocks.reduce((min, l) => l.expireAt < min ? l.expireAt : min, tokenLocks[0].expireAt);
 
     const order = await Order.create({
       id: orderId,
@@ -284,6 +297,26 @@ router.put('/:id/cancel', async (req, res) => {
       content: `订单 ${order.id} 已取消`
     });
     res.json({ code: 200, message: '取消订单成功', data: order });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.post('/:id/refund', async (req, res) => {
+  try {
+    const { userId, reason } = req.body;
+    const record = await RefundService.applyRefund(req.params.id, userId, reason);
+    res.status(201).json({ code: 201, message: '退票申请已提交', data: record });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.post('/:id/reschedule', async (req, res) => {
+  try {
+    const { userId, reason, newScheduleId } = req.body;
+    const record = await RefundService.applyReschedule(req.params.id, userId, reason, newScheduleId);
+    res.status(201).json({ code: 201, message: '改签申请已提交', data: record });
   } catch (err) {
     res.status(500).json({ code: 500, message: err.message, data: null });
   }

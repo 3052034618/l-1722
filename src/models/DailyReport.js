@@ -21,6 +21,9 @@ module.exports = (sequelize, DataTypes) => {
     totalRevenue: {
       type: DataTypes.FLOAT
     },
+    boxRevenue: {
+      type: DataTypes.FLOAT
+    },
     concessionSales: {
       type: DataTypes.FLOAT
     },

@@ -17,6 +17,10 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.INTEGER,
       allowNull: false
     },
+    lockToken: {
+      type: DataTypes.STRING,
+      allowNull: false
+    },
     lockedAt: {
       type: DataTypes.DATE
     },

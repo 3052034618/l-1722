@@ -16,6 +16,7 @@ const Member = require('./Member')(sequelize, Sequelize.DataTypes);
 const PointsRecord = require('./PointsRecord')(sequelize, Sequelize.DataTypes);
 const Notification = require('./Notification')(sequelize, Sequelize.DataTypes);
 const DailyReport = require('./DailyReport')(sequelize, Sequelize.DataTypes);
+const RefundRecord = require('./RefundRecord')(sequelize, Sequelize.DataTypes);
 
 const models = {
   User,
@@ -32,7 +33,8 @@ const models = {
   Member,
   PointsRecord,
   Notification,
-  DailyReport
+  DailyReport,
+  RefundRecord
 };
 
 Object.keys(models).forEach((modelName) => {

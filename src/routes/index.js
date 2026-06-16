@@ -9,5 +9,6 @@ router.use('/concessions', require('./concession'));
 router.use('/members', require('./member'));
 router.use('/reports', require('./report'));
 router.use('/notifications', require('./notification'));
+router.use('/refunds', require('./refund'));
 
 module.exports = router;

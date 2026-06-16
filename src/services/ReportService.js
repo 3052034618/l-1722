@@ -40,6 +40,52 @@ class ReportService {
     return parseInt(result.ticketCount, 10) || 0;
   }
 
+  async _countBoxRevenue(scheduleIds) {
+    if (!scheduleIds || scheduleIds.length === 0) return 0;
+    const result = await OrderItem.findOne({
+      where: {
+        orderId: {
+          [Op.in]: sequelize.literal(
+            `(SELECT id FROM Orders WHERE scheduleId IN (${scheduleIds.map(() => '?').join(',')}) AND status = 'paid')`
+          )
+        },
+        itemType: 'ticket'
+      },
+      attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('totalPrice')), 0), 'boxRevenue']],
+      replacements: scheduleIds,
+      raw: true
+    });
+    return parseFloat(result.boxRevenue) || 0;
+  }
+
+  async _countConcessionRevenue(orderIds) {
+    if (!orderIds || orderIds.length === 0) return { totalSales: 0, totalQty: 0 };
+    const result = await OrderItem.findOne({
+      where: { orderId: { [Op.in]: orderIds }, itemType: 'concession' },
+      attributes: [
+        [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('totalPrice')), 0), 'totalSales'],
+        [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'totalQty']
+      ],
+      raw: true
+    });
+    return {
+      totalSales: parseFloat(result.totalSales) || 0,
+      totalQty: parseInt(result.totalQty, 10) || 0
+    };
+  }
+
+  async _countConcessionRevenueForSchedule(scheduleId) {
+    const paidOrders = await Order.findAll({
+      where: { scheduleId, status: 'paid' },
+      attributes: ['id'],
+      raw: true
+    });
+    const orderIds = paidOrders.map(o => o.id);
+    if (orderIds.length === 0) return 0;
+    const result = await this._countConcessionRevenue(orderIds);
+    return result.totalSales;
+  }
+
   async _buildScheduleWhere(query) {
     const { cinemaId, movieId, hallId, startDate, endDate, startTime, endTime } = query;
     const where = {};
@@ -99,6 +145,7 @@ class ReportService {
         totalSchedules: 0,
         totalTickets: 0,
         totalRevenue: 0,
+        boxRevenue: 0,
         totalConcessionSales: 0,
         totalConcessionQuantity: 0,
         avgAttendance: 0
@@ -106,13 +153,7 @@ class ReportService {
     }
 
     const totalTickets = await this._countPaidTickets(scheduleIds);
-
-    const revResult = await Order.findOne({
-      where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
-      attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'totalRevenue']],
-      raw: true
-    });
-    const totalRevenue = parseFloat(revResult.totalRevenue) || 0;
+    const boxRevenue = await this._countBoxRevenue(scheduleIds);
 
     const paidOrders = await Order.findAll({
       where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
@@ -125,17 +166,12 @@ class ReportService {
     let totalConcessionQuantity = 0;
 
     if (orderIds.length > 0) {
-      const conResult = await OrderItem.findOne({
-        where: { orderId: { [Op.in]: orderIds }, itemType: 'concession' },
-        attributes: [
-          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('totalPrice')), 0), 'totalSales'],
-          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'totalQty']
-        ],
-        raw: true
-      });
-      totalConcessionSales = parseFloat(conResult.totalSales) || 0;
-      totalConcessionQuantity = parseInt(conResult.totalQty, 10) || 0;
+      const conResult = await this._countConcessionRevenue(orderIds);
+      totalConcessionSales = conResult.totalSales;
+      totalConcessionQuantity = conResult.totalQty;
     }
+
+    const totalRevenue = boxRevenue + totalConcessionSales;
 
     let totalRate = 0;
     let rateCount = 0;
@@ -153,6 +189,7 @@ class ReportService {
       totalSchedules: schedules.length,
       totalTickets,
       totalRevenue,
+      boxRevenue,
       totalConcessionSales,
       totalConcessionQuantity,
       avgAttendance
@@ -168,12 +205,8 @@ class ReportService {
       const capacity = schedule.Hall ? schedule.Hall.capacity : 0;
       const attendanceRate = capacity > 0 ? ticketsSold / capacity : 0;
 
-      const revResult = await Order.findOne({
-        where: { scheduleId: schedule.id, status: 'paid' },
-        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'revenue']],
-        raw: true
-      });
-      const revenue = parseFloat(revResult.revenue) || 0;
+      const boxRevenue = await this._countBoxRevenue([schedule.id]);
+      const concessionRevenue = await this._countConcessionRevenueForSchedule(schedule.id);
 
       details.push({
         scheduleId: schedule.id,
@@ -185,7 +218,8 @@ class ReportService {
         capacity,
         ticketsSold,
         attendanceRate,
-        revenue
+        boxRevenue,
+        concessionRevenue
       });
     }
 
@@ -232,22 +266,24 @@ class ReportService {
           movieTitle: schedule.Movie ? schedule.Movie.title : '',
           scheduleCount: 0,
           totalTicketsSold: 0,
-          totalRevenue: 0
+          boxRevenue: 0,
+          concessionRevenue: 0
         };
       }
       const ticketsSold = await this._countTicketsForSchedule(schedule.id);
-      const revResult = await Order.findOne({
-        where: { scheduleId: schedule.id, status: 'paid' },
-        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'revenue']],
-        raw: true
-      });
+      const scheduleBoxRevenue = await this._countBoxRevenue([schedule.id]);
+      const scheduleConcessionRevenue = await this._countConcessionRevenueForSchedule(schedule.id);
 
       movieMap[movieId].scheduleCount++;
       movieMap[movieId].totalTicketsSold += ticketsSold;
-      movieMap[movieId].totalRevenue += parseFloat(revResult.revenue) || 0;
+      movieMap[movieId].boxRevenue += scheduleBoxRevenue;
+      movieMap[movieId].concessionRevenue += scheduleConcessionRevenue;
     }
 
-    return Object.values(movieMap);
+    return Object.values(movieMap).map(m => ({
+      ...m,
+      totalRevenue: m.boxRevenue
+    }));
   }
 
   async generateDailyReport(cinemaId, reportDate, createdBy) {
@@ -279,19 +315,12 @@ class ReportService {
     }
 
     const totalTickets = await this._countPaidTickets(scheduleIds);
+    const boxRevenue = await this._countBoxRevenue(scheduleIds);
 
-    let totalRevenue = 0;
     let concessionSales = 0;
     let concessionQuantity = 0;
 
     if (scheduleIds.length > 0) {
-      const revResult = await Order.findOne({
-        where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
-        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'totalRevenue']],
-        raw: true
-      });
-      totalRevenue = parseFloat(revResult.totalRevenue) || 0;
-
       const paidOrders = await Order.findAll({
         where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
         attributes: ['id'],
@@ -300,18 +329,13 @@ class ReportService {
       const orderIds = paidOrders.map(o => o.id);
 
       if (orderIds.length > 0) {
-        const conResult = await OrderItem.findOne({
-          where: { orderId: { [Op.in]: orderIds }, itemType: 'concession' },
-          attributes: [
-            [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('totalPrice')), 0), 'totalSales'],
-            [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'totalQty']
-          ],
-          raw: true
-        });
-        concessionSales = parseFloat(conResult.totalSales) || 0;
-        concessionQuantity = parseInt(conResult.totalQty, 10) || 0;
+        const conResult = await this._countConcessionRevenue(orderIds);
+        concessionSales = conResult.totalSales;
+        concessionQuantity = conResult.totalQty;
       }
     }
+
+    const totalRevenue = boxRevenue + concessionSales;
 
     const allScheduleIds = (await Schedule.findAll({
       where: { cinemaId },
@@ -352,6 +376,7 @@ class ReportService {
       hallAttendance,
       totalTickets,
       totalRevenue,
+      boxRevenue,
       concessionSales,
       concessionQuantity,
       newMembers,
@@ -409,8 +434,9 @@ class ReportService {
     const summaryData = [
       { metric: '场次数', value: summary.totalSchedules },
       { metric: '总票数(张)', value: summary.totalTickets },
-      { metric: '总收入(元)', value: parseFloat(summary.totalRevenue.toFixed(2)) },
+      { metric: '票房收入(元)', value: parseFloat(summary.boxRevenue.toFixed(2)) },
       { metric: '卖品销售额(元)', value: parseFloat(summary.totalConcessionSales.toFixed(2)) },
+      { metric: '总收入(元)', value: parseFloat(summary.totalRevenue.toFixed(2)) },
       { metric: '卖品销量(件)', value: summary.totalConcessionQuantity },
       { metric: '平均上座率', value: (summary.avgAttendance * 100).toFixed(2) + '%' }
     ];
@@ -428,7 +454,8 @@ class ReportService {
       { header: '容量', key: 'capacity', width: 8 },
       { header: '售票数', key: 'ticketsSold', width: 8 },
       { header: '上座率', key: 'attendanceRate', width: 10 },
-      { header: '票房(元)', key: 'revenue', width: 12 }
+      { header: '票房收入(元)', key: 'boxRevenue', width: 12 },
+      { header: '卖品收入(元)', key: 'concessionRevenue', width: 12 }
     ];
     for (const d of scheduleDetail) {
       detailSheet.addRow({
@@ -436,7 +463,8 @@ class ReportService {
         startTime: new Date(d.startTime).toLocaleString('zh-CN'),
         endTime: new Date(d.endTime).toLocaleString('zh-CN'),
         attendanceRate: (d.attendanceRate * 100).toFixed(2) + '%',
-        revenue: parseFloat(d.revenue.toFixed(2))
+        boxRevenue: parseFloat(d.boxRevenue.toFixed(2)),
+        concessionRevenue: parseFloat(d.concessionRevenue.toFixed(2))
       });
     }
 
@@ -462,12 +490,14 @@ class ReportService {
       { header: '影片', key: 'movieTitle', width: 18 },
       { header: '场次数', key: 'scheduleCount', width: 8 },
       { header: '售票数', key: 'totalTicketsSold', width: 8 },
-      { header: '票房(元)', key: 'totalRevenue', width: 12 }
+      { header: '票房收入(元)', key: 'totalRevenue', width: 12 },
+      { header: '卖品收入(元)', key: 'concessionRevenue', width: 12 }
     ];
     for (const m of movieSummary) {
       movieSheet.addRow({
         ...m,
-        totalRevenue: parseFloat(m.totalRevenue.toFixed(2))
+        totalRevenue: parseFloat(m.totalRevenue.toFixed(2)),
+        concessionRevenue: parseFloat(m.concessionRevenue.toFixed(2))
       });
     }
 
@@ -521,13 +551,7 @@ class ReportService {
 
     if (todayScheduleIds.length > 0) {
       todayTotalTickets = await this._countPaidTickets(todayScheduleIds);
-
-      const revResult = await Order.findOne({
-        where: { scheduleId: { [Op.in]: todayScheduleIds }, status: 'paid' },
-        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'totalRevenue']],
-        raw: true
-      });
-      todayTotalRevenue = parseFloat(revResult.totalRevenue) || 0;
+      todayTotalRevenue = await this._countBoxRevenue(todayScheduleIds);
 
       if (todaySchedules.length > 0) {
         let totalRate = 0;
@@ -552,13 +576,7 @@ class ReportService {
 
     if (monthScheduleIds.length > 0) {
       monthTotalTickets = await this._countPaidTickets(monthScheduleIds);
-
-      const monthRevResult = await Order.findOne({
-        where: { scheduleId: { [Op.in]: monthScheduleIds }, status: 'paid' },
-        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'totalRevenue']],
-        raw: true
-      });
-      monthTotalRevenue = parseFloat(monthRevResult.totalRevenue) || 0;
+      monthTotalRevenue = await this._countBoxRevenue(monthScheduleIds);
     }
 
     const lowStockCount = await Concession.count({

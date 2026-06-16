@@ -1,4 +1,5 @@
 const { Op } = require('sequelize');
+const { v4: uuidv4 } = require('uuid');
 const { Seat, SeatLock, Schedule, Order, OrderItem, User } = require('../models');
 const config = require('../config/index');
 const NotificationService = require('./NotificationService');
@@ -50,6 +51,7 @@ class SeatLockService {
 
     const now = new Date();
     const expireAt = new Date(now.getTime() + config.seat.lockDurationMinutes * 60 * 1000);
+    const lockToken = uuidv4();
 
     const lockRecords = [];
     for (const seatId of seatIds) {
@@ -57,6 +59,7 @@ class SeatLockService {
         scheduleId,
         seatId,
         userId,
+        lockToken,
         lockedAt: now,
         expireAt,
         status: 'locked'
@@ -64,7 +67,7 @@ class SeatLockService {
       lockRecords.push(lock);
     }
 
-    return lockRecords;
+    return { lockToken, locks: lockRecords };
   }
 
   async releaseExpiredLocks() {
@@ -83,7 +86,7 @@ class SeatLockService {
       await NotificationService.notifyUsers([lock.userId], {
         type: 'seat_lock_expired',
         title: '座位锁定超时',
-        content: '您的座位锁定已超时，所选座位已释放'
+        content: `您的座位锁定已超时，所选座位已释放（凭证：${lock.lockToken}）`
       });
     }
 
@@ -145,6 +148,31 @@ class SeatLockService {
     }
 
     return locks;
+  }
+
+  async confirmLocksByToken(scheduleId, lockToken, userId) {
+    const now = new Date();
+    const locks = await SeatLock.findAll({
+      where: {
+        scheduleId,
+        lockToken,
+        userId,
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
+      }
+    });
+
+    for (const lock of locks) {
+      await lock.update({ status: 'paid' });
+    }
+
+    return locks;
+  }
+
+  async getLocksByToken(lockToken) {
+    return SeatLock.findAll({
+      where: { lockToken }
+    });
   }
 
   async getLockedSeats(scheduleId) {
