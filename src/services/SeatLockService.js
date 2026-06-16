@@ -1,0 +1,162 @@
+const { Op } = require('sequelize');
+const { Seat, SeatLock, Schedule, Order, OrderItem, User } = require('../models');
+const config = require('../config/index');
+const NotificationService = require('./NotificationService');
+
+class SeatLockService {
+  async lockSeats(scheduleId, seatIds, userId) {
+    const schedule = await Schedule.findByPk(scheduleId);
+    if (!schedule) throw new Error('Schedule not found');
+    if (schedule.status === 'cancelled') throw new Error('Schedule is cancelled');
+
+    const seats = await Seat.findAll({
+      where: { id: { [Op.in]: seatIds }, hallId: schedule.hallId }
+    });
+    if (seats.length !== seatIds.length) throw new Error('Some seats do not exist or do not belong to this hall');
+
+    const now = new Date();
+    const activeLocks = await SeatLock.findAll({
+      where: {
+        scheduleId,
+        seatId: { [Op.in]: seatIds },
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
+      }
+    });
+
+    if (activeLocks.length > 0) {
+      throw new Error('Some seats are already locked');
+    }
+
+    const soldSeats = seats.filter(s => s.status === 'sold');
+    if (soldSeats.length > 0) {
+      throw new Error('Some seats are already sold');
+    }
+
+    const expireAt = new Date(now.getTime() + config.seat.lockDurationMinutes * 60 * 1000);
+
+    const lockRecords = [];
+    for (const seatId of seatIds) {
+      const lock = await SeatLock.create({
+        scheduleId,
+        seatId,
+        userId,
+        lockedAt: now,
+        expireAt,
+        status: 'locked'
+      });
+      lockRecords.push(lock);
+
+      await Seat.update({ status: 'locked' }, { where: { id: seatId } });
+    }
+
+    return lockRecords;
+  }
+
+  async releaseExpiredLocks() {
+    const now = new Date();
+
+    const expiredLocks = await SeatLock.findAll({
+      where: {
+        status: 'locked',
+        expireAt: { [Op.lt]: now }
+      }
+    });
+
+    for (const lock of expiredLocks) {
+      await lock.update({ status: 'released' });
+      await Seat.update({ status: 'available' }, { where: { id: lock.seatId } });
+
+      await NotificationService.notifyUsers([lock.userId], {
+        type: 'seat_lock_expired',
+        title: '座位锁定超时',
+        content: '您的座位锁定已超时，所选座位已释放'
+      });
+    }
+
+    return expiredLocks.length;
+  }
+
+  async releaseLock(seatLockId, userId) {
+    const lock = await SeatLock.findByPk(seatLockId);
+    if (!lock) throw new Error('Seat lock not found');
+    if (lock.userId !== userId) throw new Error('You can only release your own locks');
+
+    await lock.update({ status: 'released' });
+    await Seat.update({ status: 'available' }, { where: { id: lock.seatId } });
+
+    return lock;
+  }
+
+  async confirmLocks(scheduleId, seatIds, userId) {
+    const locks = await SeatLock.findAll({
+      where: {
+        scheduleId,
+        seatId: { [Op.in]: seatIds },
+        userId,
+        status: 'locked'
+      }
+    });
+
+    for (const lock of locks) {
+      await lock.update({ status: 'paid' });
+      await Seat.update({ status: 'sold' }, { where: { id: lock.seatId } });
+    }
+
+    return locks;
+  }
+
+  async getLockedSeats(scheduleId) {
+    const now = new Date();
+
+    return SeatLock.findAll({
+      where: {
+        scheduleId,
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
+      },
+      include: [Seat]
+    });
+  }
+
+  async getAvailableSeats(scheduleId) {
+    const schedule = await Schedule.findByPk(scheduleId);
+    if (!schedule) throw new Error('Schedule not found');
+
+    const seats = await Seat.findAll({
+      where: { hallId: schedule.hallId }
+    });
+
+    const now = new Date();
+    const seatIds = seats.map(s => s.id);
+
+    const activeLocks = await SeatLock.findAll({
+      where: {
+        scheduleId,
+        seatId: { [Op.in]: seatIds },
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
+      }
+    });
+
+    const lockedSeatIds = new Set(activeLocks.map(l => l.seatId));
+
+    const layout = seats.map(seat => {
+      let currentStatus = seat.status;
+      if (currentStatus === 'locked' && !lockedSeatIds.has(seat.id)) {
+        currentStatus = 'available';
+      }
+      return {
+        id: seat.id,
+        row: seat.row,
+        col: seat.col,
+        seatNo: seat.seatNo,
+        status: currentStatus
+      };
+    });
+
+    return layout;
+  }
+}
+
+module.exports = new SeatLockService();
