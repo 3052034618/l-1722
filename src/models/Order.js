@@ -38,6 +38,14 @@ module.exports = (sequelize, DataTypes) => {
     },
     expireAt: {
       type: DataTypes.DATE
+    },
+    supplementAmount: {
+      type: DataTypes.FLOAT,
+      defaultValue: 0
+    },
+    supplementStatus: {
+      type: DataTypes.ENUM('none', 'pending', 'paid'),
+      defaultValue: 'none'
     }
   }, {
     tableName: 'Orders'

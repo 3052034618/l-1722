@@ -19,6 +19,8 @@ class MemberService {
     if (!member) return null;
     const levelConfig = MEMBER_LEVELS[member.level];
     return {
+      id: member.id,
+      userId: member.userId,
       level: member.level,
       points: member.points,
       totalSpent: member.totalSpent,
@@ -146,6 +148,34 @@ class MemberService {
     } catch (e) {}
 
     return { upgraded: true, newLevel };
+  }
+
+  async returnPoints(memberId, points, source, referenceId) {
+    const member = await Member.findByPk(memberId);
+    if (!member) throw new Error('会员不存在');
+
+    member.points += points;
+    await member.save();
+
+    await PointsRecord.create({
+      memberId,
+      type: 'return',
+      points,
+      source: source || '售后退回',
+      referenceId,
+      balance: member.points
+    });
+
+    await NotificationService.notifyUser(member.userId, {
+      type: 'points_returned',
+      title: '积分退回',
+      content: `${points}积分已退回至您的账户，来源：${source || '售后退回'}`
+    });
+
+    return {
+      points,
+      newBalance: member.points
+    };
   }
 
   async createMember(userId) {

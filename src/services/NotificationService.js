@@ -207,7 +207,10 @@ class NotificationService {
       'order_created', 'order_paid', 'order_cancelled', 'order_timeout_cancelled',
       'seat_lock_expired', 'schedule_updated', 'schedule_cancelled',
       'restock_approved', 'restock_rejected', 'restock_completed',
-      'points_earned', 'points_redeemed'
+      'points_earned', 'points_redeemed', 'points_returned',
+      'refund_apply', 'refund_approved', 'refund_rejected',
+      'reschedule_apply', 'reschedule_approved', 'reschedule_rejected',
+      'reschedule_supplement', 'reschedule_completed'
     ];
 
     const { page = 1, pageSize = 10, isRead, type, startDate, endDate } = query;

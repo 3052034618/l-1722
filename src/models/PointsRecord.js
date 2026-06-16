@@ -10,7 +10,7 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false
     },
     type: {
-      type: DataTypes.ENUM('earn', 'redeem', 'expire')
+      type: DataTypes.ENUM('earn', 'redeem', 'expire', 'return')
     },
     points: {
       type: DataTypes.INTEGER
