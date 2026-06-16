@@ -52,12 +52,26 @@ class ScheduleService {
     if (schedules.length === 0) return 0.5;
 
     const scheduleIds = schedules.map(s => s.id);
-    const paidOrdersCount = await Order.count({
-      where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' }
+    const { OrderItem, Order } = require('../models');
+    const { sequelize } = require('../models');
+
+    const result = await OrderItem.findOne({
+      where: {
+        orderId: {
+          [Op.in]: sequelize.literal(
+            `(SELECT id FROM Orders WHERE scheduleId IN (${scheduleIds.map(() => '?').join(',')}) AND status = 'paid')`
+          )
+        },
+        itemType: 'ticket'
+      },
+      attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'ticketCount']],
+      replacements: scheduleIds,
+      raw: true
     });
 
+    const paidTicketsCount = parseInt(result.ticketCount, 10) || 0;
     const totalCapacity = schedules.length * capacity;
-    return Math.min(paidOrdersCount / totalCapacity, 1);
+    return Math.min(paidTicketsCount / totalCapacity, 1);
   }
 
   async _getSchedulesForHallOnDate(hallId, date) {
@@ -112,7 +126,10 @@ class ScheduleService {
       where.id = { [Op.ne]: excludeScheduleId };
     }
 
-    const conflictingSchedule = await Schedule.findOne({ where });
+    const conflictingSchedule = await Schedule.findOne({
+      where,
+      include: [Movie, Hall]
+    });
 
     if (conflictingSchedule) {
       return { conflict: true, conflictingSchedule };
@@ -123,19 +140,25 @@ class ScheduleService {
   async recommendAlternativeSlots(movieId, hallId, date, conflictingStartTime) {
     const candidates = await this.recommendOptimalSlots(movieId, hallId, date);
     const conflictTime = new Date(conflictingStartTime).getTime();
-    return candidates.filter(c => c.startTime.getTime() !== conflictTime);
+    return candidates.filter(c => c.startTime.getTime() !== conflictTime && !c.conflict);
   }
 
   async createSchedule(data) {
     const { movieId, hallId, cinemaId, startTime, price } = data;
     const movie = await Movie.findByPk(movieId);
+    const hall = await Hall.findByPk(hallId);
     if (!movie) throw new Error('Movie not found');
+    if (!hall) throw new Error('Hall not found');
 
     const endTime = new Date(new Date(startTime).getTime() + (movie.duration + 15) * 60000);
 
     const conflictCheck = await this.checkConflict(hallId, startTime, endTime);
     if (conflictCheck.conflict) {
-      throw new Error('Schedule conflicts with existing schedule');
+      const { Movie, Hall } = require('../models');
+      const cs = conflictCheck.conflictingSchedule;
+      const csMovie = cs.Movie || (cs.MovieId ? await Movie.findByPk(cs.MovieId) : null);
+      const csHall = cs.Hall || (cs.HallId ? await Hall.findByPk(cs.HallId) : null);
+      throw new Error(`场次冲突：${csMovie ? csMovie.title : '未知影片'} ${csHall ? '在' + csHall.name : ''} ${cs.startTime}`);
     }
 
     const schedule = await Schedule.create({
@@ -149,19 +172,29 @@ class ScheduleService {
       locked: false
     });
 
-    await NotificationService.notifyAdmins({
+    const loadedSchedule = await Schedule.findByPk(schedule.id, { include: [Movie, Hall] });
+
+    await NotificationService.notifyAllStaff({
       type: 'schedule_created',
-      title: 'New Schedule Created',
-      content: `New schedule created for movie "${movie.title}"`
+      title: '新场次创建',
+      content: `新场次已创建：${movie.title} ${loadedSchedule.Hall ? loadedSchedule.Hall.name : ''} ${new Date(startTime).toLocaleString('zh-CN')}`
     });
 
-    return schedule;
+    return loadedSchedule;
   }
 
   async lockSchedule(scheduleId, lockedBy) {
     const schedule = await Schedule.findByPk(scheduleId);
     if (!schedule) throw new Error('Schedule not found');
     await schedule.update({ locked: true, lockedBy });
+
+    const loaded = await Schedule.findByPk(scheduleId, { include: [Movie] });
+    await NotificationService.notifyAllStaff({
+      type: 'schedule_locked',
+      title: '场次已锁定',
+      content: `场次${loaded.Movie ? '"' + loaded.Movie.title + '"' : ''}(${scheduleId})已被锁定，禁止修改`
+    });
+
     return schedule;
   }
 
@@ -169,6 +202,14 @@ class ScheduleService {
     const schedule = await Schedule.findByPk(scheduleId);
     if (!schedule) throw new Error('Schedule not found');
     await schedule.update({ locked: false, lockedBy: null });
+
+    const loaded = await Schedule.findByPk(scheduleId, { include: [Movie] });
+    await NotificationService.notifyAllStaff({
+      type: 'schedule_unlocked',
+      title: '场次已解锁',
+      content: `场次${loaded.Movie ? '"' + loaded.Movie.title + '"' : ''}(${scheduleId})已解锁，可以进行修改`
+    });
+
     return schedule;
   }
 
@@ -186,34 +227,58 @@ class ScheduleService {
       const endTime = new Date(new Date(startTime).getTime() + (movie.duration + 15) * 60000);
       data.endTime = endTime;
 
-      const conflictCheck = await this.checkConflict(schedule.hallId, startTime, endTime, scheduleId);
+      const hallId = data.hallId || schedule.hallId;
+      const conflictCheck = await this.checkConflict(hallId, startTime, endTime, scheduleId);
       if (conflictCheck.conflict) {
         throw new Error('Updated schedule conflicts with existing schedule');
       }
     }
 
+    const oldStartTime = schedule.startTime;
+    const oldMovieId = schedule.movieId;
     await schedule.update(data);
 
-    await NotificationService.notifyAdmins({
+    const loaded = await Schedule.findByPk(scheduleId, { include: [Movie, Hall] });
+    const hasTimeChange = data.startTime && new Date(data.startTime).getTime() !== new Date(oldStartTime).getTime();
+    const hasMovieChange = data.movieId && data.movieId !== oldMovieId;
+
+    const changeDesc = [];
+    if (hasMovieChange) changeDesc.push('影片');
+    if (hasTimeChange) changeDesc.push('时间');
+    if (data.hallId) changeDesc.push('影厅');
+
+    await NotificationService.notifyAllStaff({
       type: 'schedule_updated',
-      title: 'Schedule Updated',
-      content: `Schedule ${scheduleId} has been updated`
+      title: '场次信息变更',
+      content: `场次${loaded.Movie ? '"' + loaded.Movie.title + '"' : ''}${changeDesc.length ? changeDesc.join('/') + '已' : ''}变更，${loaded.Hall ? loaded.Hall.name : ''} ${new Date(loaded.startTime).toLocaleString('zh-CN')}`
     });
 
-    return schedule;
+    const affectedOrders = await Order.findAll({
+      where: { scheduleId, status: { [Op.in]: ['pending', 'paid'] } }
+    });
+    if (affectedOrders.length > 0) {
+      const userIds = [...new Set(affectedOrders.map(o => o.userId))];
+      await NotificationService.notifyUsers(userIds, {
+        type: 'schedule_updated',
+        title: '场次信息变更通知',
+        content: `您已购票的场次${loaded.Movie ? '"' + loaded.Movie.title + '"' : ''}已变更，请查看最新排期。${loaded.Hall ? loaded.Hall.name : ''} ${new Date(loaded.startTime).toLocaleString('zh-CN')}`
+      });
+    }
+
+    return loaded;
   }
 
   async cancelSchedule(scheduleId) {
-    const schedule = await Schedule.findByPk(scheduleId);
+    const schedule = await Schedule.findByPk(scheduleId, { include: [Movie, Hall] });
     if (!schedule) throw new Error('Schedule not found');
     if (schedule.locked) throw new Error('Schedule is locked and cannot be cancelled');
 
     await schedule.update({ status: 'cancelled' });
 
-    await NotificationService.notifyAdmins({
+    await NotificationService.notifyAllStaff({
       type: 'schedule_cancelled',
-      title: 'Schedule Cancelled',
-      content: `Schedule ${scheduleId} has been cancelled`
+      title: '场次已取消',
+      content: `场次已取消：${schedule.Movie ? schedule.Movie.title : ''} ${schedule.Hall ? schedule.Hall.name : ''} ${new Date(schedule.startTime).toLocaleString('zh-CN')}`
     });
 
     const orders = await Order.findAll({
@@ -224,8 +289,8 @@ class ScheduleService {
       const userIds = [...new Set(orders.map(o => o.userId))];
       await NotificationService.notifyUsers(userIds, {
         type: 'schedule_cancelled',
-        title: 'Schedule Cancelled',
-        content: 'A movie you booked has been cancelled. Please contact us for a refund.'
+        title: '场次取消通知',
+        content: `您已购票的场次"${schedule.Movie ? schedule.Movie.title : ''}"已取消，请联系影院办理退款。给您带来不便敬请谅解。`
       });
     }
 
@@ -249,7 +314,8 @@ class ScheduleService {
 
     return Schedule.findAll({
       where,
-      include: [Movie, Hall]
+      include: [Movie, Hall],
+      order: [['startTime', 'ASC']]
     });
   }
 }

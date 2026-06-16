@@ -25,9 +25,17 @@ router.get('/', async (req, res) => {
 router.get('/export', async (req, res) => {
   try {
     const filePath = await ReportService.exportToExcel(req.query);
-    res.download(filePath, path.basename(filePath), (err) => {
+    const fileName = path.basename(filePath);
+    if (req.query.format === 'json') {
+      return res.json({
+        code: 200,
+        message: '导出成功',
+        data: { filePath, fileName, downloadUrl: '/exports/' + fileName }
+      });
+    }
+    res.download(filePath, fileName, (err) => {
       if (err) {
-        res.status(500).json({ code: 500, message: '导出失败', data: null });
+        res.status(500).json({ code: 500, message: '导出失败', data: { filePath, fileName } });
       }
     });
   } catch (err) {

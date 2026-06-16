@@ -5,6 +5,41 @@ const path = require('path');
 const fs = require('fs');
 
 class ReportService {
+  async _countPaidTickets(scheduleIds) {
+    if (!scheduleIds || scheduleIds.length === 0) return 0;
+    const result = await OrderItem.findOne({
+      where: {
+        orderId: {
+          [Op.in]: sequelize.literal(
+            `(SELECT id FROM Orders WHERE scheduleId IN (${scheduleIds.map(() => '?').join(',')}) AND status = 'paid')`
+          )
+        },
+        itemType: 'ticket'
+      },
+      attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'ticketCount']],
+      replacements: scheduleIds,
+      raw: true
+    });
+    return parseInt(result.ticketCount, 10) || 0;
+  }
+
+  async _countTicketsForSchedule(scheduleId) {
+    const result = await OrderItem.findOne({
+      where: {
+        orderId: {
+          [Op.in]: sequelize.literal(
+            `(SELECT id FROM Orders WHERE scheduleId = ? AND status = 'paid')`
+          )
+        },
+        itemType: 'ticket'
+      },
+      attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'ticketCount']],
+      replacements: [scheduleId],
+      raw: true
+    });
+    return parseInt(result.ticketCount, 10) || 0;
+  }
+
   async generateDailyReport(cinemaId, reportDate, createdBy) {
     if (!reportDate) {
       const yesterday = new Date();
@@ -26,25 +61,20 @@ class ReportService {
     if (schedules.length > 0) {
       let totalRate = 0;
       for (const schedule of schedules) {
-        const paidCount = await Order.count({
-          where: { scheduleId: schedule.id, status: 'paid' }
-        });
+        const ticketsSold = await this._countTicketsForSchedule(schedule.id);
         const capacity = schedule.Hall ? schedule.Hall.capacity : 0;
-        totalRate += capacity > 0 ? paidCount / capacity : 0;
+        totalRate += capacity > 0 ? ticketsSold / capacity : 0;
       }
       hallAttendance = totalRate / schedules.length;
     }
 
-    let totalTickets = 0;
+    const totalTickets = await this._countPaidTickets(scheduleIds);
+
     let totalRevenue = 0;
     let concessionSales = 0;
     let concessionQuantity = 0;
 
     if (scheduleIds.length > 0) {
-      totalTickets = await Order.count({
-        where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' }
-      });
-
       const revResult = await Order.findOne({
         where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
         attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'totalRevenue']],
@@ -162,13 +192,13 @@ class ReportService {
     sheet.columns = [
       { header: '日期', key: 'reportDate', width: 12 },
       { header: '影院', key: 'cinemaName', width: 15 },
-      { header: '上座率', key: 'hallAttendance', width: 10 },
-      { header: '总票数', key: 'totalTickets', width: 10 },
-      { header: '总收入', key: 'totalRevenue', width: 12 },
-      { header: '卖品销售额', key: 'concessionSales', width: 12 },
-      { header: '卖品销量', key: 'concessionQuantity', width: 10 },
-      { header: '新增会员', key: 'newMembers', width: 10 },
-      { header: '累计会员', key: 'totalMembers', width: 10 }
+      { header: '上座率', key: 'hallAttendance', width: 12 },
+      { header: '总票数(张)', key: 'totalTickets', width: 12 },
+      { header: '总收入(元)', key: 'totalRevenue', width: 14 },
+      { header: '卖品销售额(元)', key: 'concessionSales', width: 14 },
+      { header: '卖品销量(件)', key: 'concessionQuantity', width: 12 },
+      { header: '新增会员(人)', key: 'newMembers', width: 12 },
+      { header: '累计会员(人)', key: 'totalMembers', width: 12 }
     ];
 
     const headerRow = sheet.getRow(1);
@@ -179,19 +209,20 @@ class ReportService {
         pattern: 'solid',
         fgColor: { argb: 'FF4472C4' }
       };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
     });
 
     for (const report of reports) {
       sheet.addRow({
         reportDate: report.reportDate,
         cinemaName: report.Cinema ? report.Cinema.name : '',
-        hallAttendance: report.hallAttendance,
-        totalTickets: report.totalTickets,
-        totalRevenue: report.totalRevenue,
-        concessionSales: report.concessionSales,
-        concessionQuantity: report.concessionQuantity,
-        newMembers: report.newMembers,
-        totalMembers: report.totalMembers
+        hallAttendance: report.hallAttendance ? (parseFloat(report.hallAttendance) * 100).toFixed(2) + '%' : '0.00%',
+        totalTickets: report.totalTickets || 0,
+        totalRevenue: report.totalRevenue ? parseFloat(report.totalRevenue).toFixed(2) : '0.00',
+        concessionSales: report.concessionSales ? parseFloat(report.concessionSales).toFixed(2) : '0.00',
+        concessionQuantity: report.concessionQuantity || 0,
+        newMembers: report.newMembers || 0,
+        totalMembers: report.totalMembers || 0
       });
     }
 
@@ -230,9 +261,7 @@ class ReportService {
 
       const scheduleDetails = [];
       for (const schedule of schedules) {
-        const ticketsSold = await Order.count({
-          where: { scheduleId: schedule.id, status: 'paid' }
-        });
+        const ticketsSold = await this._countTicketsForSchedule(schedule.id);
         const capacity = hall.capacity;
         scheduleDetails.push({
           schedule,
@@ -270,9 +299,7 @@ class ReportService {
     let todayAttendance = 0;
 
     if (todayScheduleIds.length > 0) {
-      todayTotalTickets = await Order.count({
-        where: { scheduleId: { [Op.in]: todayScheduleIds }, status: 'paid' }
-      });
+      todayTotalTickets = await this._countPaidTickets(todayScheduleIds);
 
       const revResult = await Order.findOne({
         where: { scheduleId: { [Op.in]: todayScheduleIds }, status: 'paid' },
@@ -284,11 +311,9 @@ class ReportService {
       if (todaySchedules.length > 0) {
         let totalRate = 0;
         for (const schedule of todaySchedules) {
-          const paidCount = await Order.count({
-            where: { scheduleId: schedule.id, status: 'paid' }
-          });
+          const ticketsSold = await this._countTicketsForSchedule(schedule.id);
           const capacity = schedule.Hall ? schedule.Hall.capacity : 0;
-          totalRate += capacity > 0 ? paidCount / capacity : 0;
+          totalRate += capacity > 0 ? ticketsSold / capacity : 0;
         }
         todayAttendance = totalRate / todaySchedules.length;
       }
@@ -305,9 +330,7 @@ class ReportService {
     let monthTotalTickets = 0;
 
     if (monthScheduleIds.length > 0) {
-      monthTotalTickets = await Order.count({
-        where: { scheduleId: { [Op.in]: monthScheduleIds }, status: 'paid' }
-      });
+      monthTotalTickets = await this._countPaidTickets(monthScheduleIds);
 
       const monthRevResult = await Order.findOne({
         where: { scheduleId: { [Op.in]: monthScheduleIds }, status: 'paid' },

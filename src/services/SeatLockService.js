@@ -4,6 +4,29 @@ const config = require('../config/index');
 const NotificationService = require('./NotificationService');
 
 class SeatLockService {
+  async _getSoldSeatIds(scheduleId) {
+    const paidLocks = await SeatLock.findAll({
+      where: { scheduleId, status: 'paid' },
+      attributes: ['seatId'],
+      raw: true
+    });
+    return new Set(paidLocks.map(l => l.seatId));
+  }
+
+  async _getLockedSeatIds(scheduleId) {
+    const now = new Date();
+    const activeLocks = await SeatLock.findAll({
+      where: {
+        scheduleId,
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
+      },
+      attributes: ['seatId'],
+      raw: true
+    });
+    return new Set(activeLocks.map(l => l.seatId));
+  }
+
   async lockSeats(scheduleId, seatIds, userId) {
     const schedule = await Schedule.findByPk(scheduleId);
     if (!schedule) throw new Error('Schedule not found');
@@ -14,25 +37,18 @@ class SeatLockService {
     });
     if (seats.length !== seatIds.length) throw new Error('Some seats do not exist or do not belong to this hall');
 
+    const maintenanceSeats = seats.filter(s => s.status === 'maintenance');
+    if (maintenanceSeats.length > 0) throw new Error('Some seats are under maintenance');
+
+    const soldSeatIds = await this._getSoldSeatIds(scheduleId);
+    const soldRequested = seatIds.filter(id => soldSeatIds.has(id));
+    if (soldRequested.length > 0) throw new Error('Some seats are already sold for this schedule');
+
+    const lockedSeatIds = await this._getLockedSeatIds(scheduleId);
+    const lockedRequested = seatIds.filter(id => lockedSeatIds.has(id));
+    if (lockedRequested.length > 0) throw new Error('Some seats are already locked for this schedule');
+
     const now = new Date();
-    const activeLocks = await SeatLock.findAll({
-      where: {
-        scheduleId,
-        seatId: { [Op.in]: seatIds },
-        status: 'locked',
-        expireAt: { [Op.gt]: now }
-      }
-    });
-
-    if (activeLocks.length > 0) {
-      throw new Error('Some seats are already locked');
-    }
-
-    const soldSeats = seats.filter(s => s.status === 'sold');
-    if (soldSeats.length > 0) {
-      throw new Error('Some seats are already sold');
-    }
-
     const expireAt = new Date(now.getTime() + config.seat.lockDurationMinutes * 60 * 1000);
 
     const lockRecords = [];
@@ -46,8 +62,6 @@ class SeatLockService {
         status: 'locked'
       });
       lockRecords.push(lock);
-
-      await Seat.update({ status: 'locked' }, { where: { id: seatId } });
     }
 
     return lockRecords;
@@ -65,7 +79,6 @@ class SeatLockService {
 
     for (const lock of expiredLocks) {
       await lock.update({ status: 'released' });
-      await Seat.update({ status: 'available' }, { where: { id: lock.seatId } });
 
       await NotificationService.notifyUsers([lock.userId], {
         type: 'seat_lock_expired',
@@ -83,24 +96,52 @@ class SeatLockService {
     if (lock.userId !== userId) throw new Error('You can only release your own locks');
 
     await lock.update({ status: 'released' });
-    await Seat.update({ status: 'available' }, { where: { id: lock.seatId } });
 
     return lock;
   }
 
+  async releaseSeatsForOrder(scheduleId, seatIds) {
+    const locks = await SeatLock.findAll({
+      where: {
+        scheduleId,
+        seatId: { [Op.in]: seatIds },
+        status: 'paid'
+      }
+    });
+
+    for (const lock of locks) {
+      await lock.update({ status: 'released' });
+    }
+
+    return locks;
+  }
+
+  async getUserActiveLocks(scheduleId, userId) {
+    const now = new Date();
+    return SeatLock.findAll({
+      where: {
+        scheduleId,
+        userId,
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
+      }
+    });
+  }
+
   async confirmLocks(scheduleId, seatIds, userId) {
+    const now = new Date();
     const locks = await SeatLock.findAll({
       where: {
         scheduleId,
         seatId: { [Op.in]: seatIds },
         userId,
-        status: 'locked'
+        status: 'locked',
+        expireAt: { [Op.gt]: now }
       }
     });
 
     for (const lock of locks) {
       await lock.update({ status: 'paid' });
-      await Seat.update({ status: 'sold' }, { where: { id: lock.seatId } });
     }
 
     return locks;
@@ -127,24 +168,17 @@ class SeatLockService {
       where: { hallId: schedule.hallId }
     });
 
-    const now = new Date();
-    const seatIds = seats.map(s => s.id);
-
-    const activeLocks = await SeatLock.findAll({
-      where: {
-        scheduleId,
-        seatId: { [Op.in]: seatIds },
-        status: 'locked',
-        expireAt: { [Op.gt]: now }
-      }
-    });
-
-    const lockedSeatIds = new Set(activeLocks.map(l => l.seatId));
+    const soldSeatIds = await this._getSoldSeatIds(scheduleId);
+    const lockedSeatIds = await this._getLockedSeatIds(scheduleId);
 
     const layout = seats.map(seat => {
       let currentStatus = seat.status;
-      if (currentStatus === 'locked' && !lockedSeatIds.has(seat.id)) {
-        currentStatus = 'available';
+      if (currentStatus === 'available') {
+        if (soldSeatIds.has(seat.id)) {
+          currentStatus = 'sold';
+        } else if (lockedSeatIds.has(seat.id)) {
+          currentStatus = 'locked';
+        }
       }
       return {
         id: seat.id,
