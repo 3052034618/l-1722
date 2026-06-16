@@ -20,13 +20,22 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING
     },
     status: {
-      type: DataTypes.ENUM('pending', 'approved', 'rejected', 'purchased')
+      type: DataTypes.ENUM('pending', 'approved', 'purchasing', 'purchased', 'rejected')
     },
     approvedBy: {
       type: DataTypes.INTEGER
     },
     approvedAt: {
       type: DataTypes.DATE
+    },
+    purchasedBy: {
+      type: DataTypes.INTEGER
+    },
+    purchasedAt: {
+      type: DataTypes.DATE
+    },
+    purchasedQuantity: {
+      type: DataTypes.INTEGER
     }
   }, {
     tableName: 'RestockRequests'
@@ -36,6 +45,7 @@ module.exports = (sequelize, DataTypes) => {
     RestockRequest.belongsTo(models.Concession, { foreignKey: 'concessionId' });
     RestockRequest.belongsTo(models.User, { foreignKey: 'requestedBy', as: 'Requester' });
     RestockRequest.belongsTo(models.User, { foreignKey: 'approvedBy', as: 'Approver' });
+    RestockRequest.belongsTo(models.User, { foreignKey: 'purchasedBy', as: 'Purchaser' });
   };
 
   return RestockRequest;

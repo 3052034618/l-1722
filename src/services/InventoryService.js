@@ -49,11 +49,10 @@ class InventoryService {
     if (!safetyCheck.isBelowSafety) throw new Error('Concession stock is above safety level');
 
     const deficit = Math.max(concession.safetyStock * 2 - concession.stock, concession.safetyStock);
-    const effectiveRequestedBy = requestedBy || null;
 
     const restockRequest = await RestockRequest.create({
       concessionId,
-      requestedBy: effectiveRequestedBy,
+      requestedBy: requestedBy || null,
       quantity: deficit,
       reason: '库存低于安全水位自动生成',
       status: 'pending'
@@ -62,12 +61,12 @@ class InventoryService {
     await NotificationService.notifyAdmins({
       type: 'restock_auto_generated',
       title: '补货申请自动生成',
-      content: `卖品[${concession.name}]库存不足（当前${concession.stock}/安全线${concession.safetyStock}），已自动生成补货申请`
+      content: `卖品[${concession.name}]库存不足（当前${concession.stock}/安全线${concession.safetyStock}），已自动生成补货申请#${restockRequest.id}`
     });
     await NotificationService.notifySellers({
       type: 'restock_auto_generated',
       title: '库存预警通知',
-      content: `卖品[${concession.name}]库存不足，已自动生成补货申请`
+      content: `卖品[${concession.name}]库存不足，已自动生成补货申请#${restockRequest.id}`
     });
 
     return restockRequest;
@@ -82,7 +81,7 @@ class InventoryService {
         const existingPending = await RestockRequest.count({
           where: {
             concessionId: item.concession.id,
-            status: { [Op.in]: ['pending', 'approved'] }
+            status: { [Op.in]: ['pending', 'approved', 'purchasing'] }
           }
         });
 
@@ -105,7 +104,7 @@ class InventoryService {
       await NotificationService.notifyAdmins({
         type: 'restock_batch_generated',
         title: '补货申请批量生成',
-        content: `库存扫描完成，共生成 ${requests.length} 条补货申请，请及时处理`
+        content: `库存扫描完成，共生成 ${requests.length} 条补货申请，请及时审批`
       });
       await NotificationService.notifySellers({
         type: 'inventory_alert',
@@ -120,7 +119,7 @@ class InventoryService {
   async approveRestockRequest(requestId, approvedBy) {
     const request = await RestockRequest.findByPk(requestId, { include: [Concession] });
     if (!request) throw new Error('Restock request not found');
-    if (request.status !== 'pending') throw new Error('Restock request is not in pending status');
+    if (request.status !== 'pending') throw new Error('Only pending requests can be approved');
 
     await request.update({
       status: 'approved',
@@ -128,23 +127,25 @@ class InventoryService {
       approvedAt: new Date()
     });
 
+    const concessionName = request.Concession ? request.Concession.name : '';
+
     if (request.requestedBy) {
       await NotificationService.notifyUsers([request.requestedBy], {
         type: 'restock_approved',
-        title: '补货申请已审批',
-        content: `您发起的[${request.Concession ? request.Concession.name : ''}]补货申请已审批通过`
+        title: '补货申请已审批通过',
+        content: `您发起的[${concessionName}]补货申请#${request.id}已审批通过，即将进入采购流程`
       });
     }
 
     await NotificationService.notifyAdmins({
       type: 'restock_purchase_needed',
       title: '补货申请待采购',
-      content: `有新的补货申请已审批，请及时采购`
+      content: `补货申请#${request.id}[${concessionName}]已审批通过，请安排采购`
     });
     await NotificationService.notifySellers({
       type: 'restock_approved',
       title: '补货审批通过',
-      content: `补货申请已审批，${request.Concession ? request.Concession.name : ''}正在采购中`
+      content: `补货申请#${request.id}[${concessionName}]已审批通过，正在安排采购`
     });
 
     return request;
@@ -153,7 +154,7 @@ class InventoryService {
   async rejectRestockRequest(requestId, approvedBy, reason) {
     const request = await RestockRequest.findByPk(requestId, { include: [Concession] });
     if (!request) throw new Error('Restock request not found');
-    if (request.status !== 'pending') throw new Error('Restock request is not in pending status');
+    if (request.status !== 'pending') throw new Error('Only pending requests can be rejected');
 
     await request.update({
       status: 'rejected',
@@ -161,40 +162,86 @@ class InventoryService {
       approvedAt: new Date()
     });
 
+    const concessionName = request.Concession ? request.Concession.name : '';
+
     if (request.requestedBy) {
       await NotificationService.notifyUsers([request.requestedBy], {
         type: 'restock_rejected',
         title: '补货申请已拒绝',
-        content: `您的补货申请已被拒绝，原因：${reason || '未填写'}`
+        content: `您发起的[${concessionName}]补货申请#${request.id}已被拒绝，原因：${reason || '未填写'}`
       });
     }
+
+    await NotificationService.notifyAdmins({
+      type: 'restock_rejected',
+      title: '补货申请已拒绝',
+      content: `补货申请#${request.id}[${concessionName}]已被拒绝`
+    });
+
+    return request;
+  }
+
+  async startPurchase(requestId, purchasedBy) {
+    const request = await RestockRequest.findByPk(requestId, { include: [Concession] });
+    if (!request) throw new Error('Restock request not found');
+    if (request.status !== 'approved') throw new Error('Only approved requests can start purchasing');
+
+    await request.update({
+      status: 'purchasing',
+      purchasedBy
+    });
+
+    const concessionName = request.Concession ? request.Concession.name : '';
+
+    await NotificationService.notifyAdmins({
+      type: 'restock_purchasing',
+      title: '补货采购中',
+      content: `补货申请#${request.id}[${concessionName}]已开始采购，采购人ID：${purchasedBy || '未指定'}`
+    });
+    await NotificationService.notifySellers({
+      type: 'restock_purchasing',
+      title: '补货采购中',
+      content: `卖品[${concessionName}]正在采购中，请稍候`
+    });
 
     return request;
   }
 
   async completePurchase(requestId, quantity) {
-    const request = await RestockRequest.findByPk(requestId, {
-      include: [Concession]
-    });
+    const request = await RestockRequest.findByPk(requestId, { include: [Concession] });
     if (!request) throw new Error('Restock request not found');
-    if (request.status !== 'approved') throw new Error('Restock request is not in approved status');
-
-    await request.update({ status: 'purchased' });
+    if (request.status !== 'purchasing') throw new Error('Only purchasing requests can be completed');
 
     const concession = await Concession.findByPk(request.concessionId);
     const actualQty = quantity || request.quantity;
     await concession.update({ stock: concession.stock + actualQty });
 
+    await request.update({
+      status: 'purchased',
+      purchasedQuantity: actualQty,
+      purchasedAt: new Date()
+    });
+
+    const concessionName = request.Concession ? request.Concession.name : '';
+
     await NotificationService.notifyAdmins({
       type: 'restock_completed',
       title: '补货采购完成',
-      content: `卖品[${concession.name}]已完成采购入库，数量：${actualQty}，当前库存：${concession.stock}`
+      content: `补货申请#${request.id}[${concessionName}]已完成采购入库，数量：${actualQty}，当前库存：${concession.stock}`
     });
     await NotificationService.notifySellers({
       type: 'restock_completed',
       title: '卖品补货完成',
-      content: `卖品[${concession.name}]已入库，数量：${actualQty}`
+      content: `卖品[${concessionName}]已入库，数量：${actualQty}，当前库存：${concession.stock}`
     });
+
+    if (request.purchasedBy) {
+      await NotificationService.notifyUsers([request.purchasedBy], {
+        type: 'restock_completed',
+        title: '采购入库完成',
+        content: `您采购的[${concessionName}]已完成入库，数量：${actualQty}`
+      });
+    }
 
     return request;
   }
@@ -209,7 +256,7 @@ class InventoryService {
     const existingPending = await RestockRequest.count({
       where: {
         concessionId,
-        status: { [Op.in]: ['pending', 'approved'] }
+        status: { [Op.in]: ['pending', 'approved', 'purchasing'] }
       }
     });
 

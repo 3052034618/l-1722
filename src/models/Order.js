@@ -35,6 +35,9 @@ module.exports = (sequelize, DataTypes) => {
     },
     payTime: {
       type: DataTypes.DATE
+    },
+    expireAt: {
+      type: DataTypes.DATE
     }
   }, {
     tableName: 'Orders'

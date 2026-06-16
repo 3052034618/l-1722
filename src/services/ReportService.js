@@ -40,6 +40,216 @@ class ReportService {
     return parseInt(result.ticketCount, 10) || 0;
   }
 
+  async _buildScheduleWhere(query) {
+    const { cinemaId, movieId, hallId, startDate, endDate, startTime, endTime } = query;
+    const where = {};
+
+    if (cinemaId) where.cinemaId = cinemaId;
+    if (movieId) where.movieId = movieId;
+    if (hallId) where.hallId = hallId;
+
+    if (startDate || endDate) {
+      where.startTime = where.startTime || {};
+      if (startDate) {
+        const s = new Date(startDate + 'T00:00:00');
+        where.startTime[Op.gte] = s;
+      }
+      if (endDate) {
+        const e = new Date(endDate + 'T23:59:59.999');
+        where.startTime[Op.lte] = e;
+      }
+    }
+
+    if (startTime && endTime) {
+      const startHour = parseInt(startTime.split(':')[0], 10);
+      const startMin = parseInt(startTime.split(':')[1] || '0', 10);
+      const endHour = parseInt(endTime.split(':')[0], 10);
+      const endMin = parseInt(endTime.split(':')[1] || '0', 10);
+
+      where[Op.and] = [
+        sequelize.where(
+          sequelize.literal(`(CAST(strftime('%H', startTime) AS INTEGER) * 60 + CAST(strftime('%M', startTime) AS INTEGER))`),
+          { [Op.gte]: startHour * 60 + startMin }
+        ),
+        sequelize.where(
+          sequelize.literal(`(CAST(strftime('%H', startTime) AS INTEGER) * 60 + CAST(strftime('%M', startTime) AS INTEGER))`),
+          { [Op.lte]: endHour * 60 + endMin }
+        )
+      ];
+    }
+
+    return where;
+  }
+
+  async getFilteredSchedules(query) {
+    const where = await this._buildScheduleWhere(query);
+    return Schedule.findAll({
+      where,
+      include: [Movie, Hall, Cinema],
+      order: [['startTime', 'ASC']]
+    });
+  }
+
+  async getSummary(query) {
+    const schedules = await this.getFilteredSchedules(query);
+    const scheduleIds = schedules.map(s => s.id);
+
+    if (scheduleIds.length === 0) {
+      return {
+        totalSchedules: 0,
+        totalTickets: 0,
+        totalRevenue: 0,
+        totalConcessionSales: 0,
+        totalConcessionQuantity: 0,
+        avgAttendance: 0
+      };
+    }
+
+    const totalTickets = await this._countPaidTickets(scheduleIds);
+
+    const revResult = await Order.findOne({
+      where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
+      attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'totalRevenue']],
+      raw: true
+    });
+    const totalRevenue = parseFloat(revResult.totalRevenue) || 0;
+
+    const paidOrders = await Order.findAll({
+      where: { scheduleId: { [Op.in]: scheduleIds }, status: 'paid' },
+      attributes: ['id'],
+      raw: true
+    });
+    const orderIds = paidOrders.map(o => o.id);
+
+    let totalConcessionSales = 0;
+    let totalConcessionQuantity = 0;
+
+    if (orderIds.length > 0) {
+      const conResult = await OrderItem.findOne({
+        where: { orderId: { [Op.in]: orderIds }, itemType: 'concession' },
+        attributes: [
+          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('totalPrice')), 0), 'totalSales'],
+          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('quantity')), 0), 'totalQty']
+        ],
+        raw: true
+      });
+      totalConcessionSales = parseFloat(conResult.totalSales) || 0;
+      totalConcessionQuantity = parseInt(conResult.totalQty, 10) || 0;
+    }
+
+    let totalRate = 0;
+    let rateCount = 0;
+    for (const schedule of schedules) {
+      const ticketsSold = await this._countTicketsForSchedule(schedule.id);
+      const capacity = schedule.Hall ? schedule.Hall.capacity : 0;
+      if (capacity > 0) {
+        totalRate += ticketsSold / capacity;
+        rateCount++;
+      }
+    }
+    const avgAttendance = rateCount > 0 ? totalRate / rateCount : 0;
+
+    return {
+      totalSchedules: schedules.length,
+      totalTickets,
+      totalRevenue,
+      totalConcessionSales,
+      totalConcessionQuantity,
+      avgAttendance
+    };
+  }
+
+  async getScheduleDetail(query) {
+    const schedules = await this.getFilteredSchedules(query);
+    const details = [];
+
+    for (const schedule of schedules) {
+      const ticketsSold = await this._countTicketsForSchedule(schedule.id);
+      const capacity = schedule.Hall ? schedule.Hall.capacity : 0;
+      const attendanceRate = capacity > 0 ? ticketsSold / capacity : 0;
+
+      const revResult = await Order.findOne({
+        where: { scheduleId: schedule.id, status: 'paid' },
+        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'revenue']],
+        raw: true
+      });
+      const revenue = parseFloat(revResult.revenue) || 0;
+
+      details.push({
+        scheduleId: schedule.id,
+        movieTitle: schedule.Movie ? schedule.Movie.title : '',
+        hallName: schedule.Hall ? schedule.Hall.name : '',
+        cinemaName: schedule.Cinema ? schedule.Cinema.name : '',
+        startTime: schedule.startTime,
+        endTime: schedule.endTime,
+        capacity,
+        ticketsSold,
+        attendanceRate,
+        revenue
+      });
+    }
+
+    return details;
+  }
+
+  async getHallSummary(query) {
+    const schedules = await this.getFilteredSchedules(query);
+    const hallMap = {};
+
+    for (const schedule of schedules) {
+      const hallId = schedule.hallId;
+      if (!hallMap[hallId]) {
+        hallMap[hallId] = {
+          hallId,
+          hallName: schedule.Hall ? schedule.Hall.name : '',
+          hallType: schedule.Hall ? schedule.Hall.type : '',
+          cinemaName: schedule.Cinema ? schedule.Cinema.name : '',
+          capacity: schedule.Hall ? schedule.Hall.capacity : 0,
+          scheduleCount: 0,
+          totalTicketsSold: 0
+        };
+      }
+      const ticketsSold = await this._countTicketsForSchedule(schedule.id);
+      hallMap[hallId].scheduleCount++;
+      hallMap[hallId].totalTicketsSold += ticketsSold;
+    }
+
+    return Object.values(hallMap).map(h => ({
+      ...h,
+      attendanceRate: h.capacity > 0 ? h.totalTicketsSold / (h.capacity * h.scheduleCount) : 0
+    }));
+  }
+
+  async getMovieSummary(query) {
+    const schedules = await this.getFilteredSchedules(query);
+    const movieMap = {};
+
+    for (const schedule of schedules) {
+      const movieId = schedule.movieId;
+      if (!movieMap[movieId]) {
+        movieMap[movieId] = {
+          movieId,
+          movieTitle: schedule.Movie ? schedule.Movie.title : '',
+          scheduleCount: 0,
+          totalTicketsSold: 0,
+          totalRevenue: 0
+        };
+      }
+      const ticketsSold = await this._countTicketsForSchedule(schedule.id);
+      const revResult = await Order.findOne({
+        where: { scheduleId: schedule.id, status: 'paid' },
+        attributes: [[sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('payAmount')), 0), 'revenue']],
+        raw: true
+      });
+
+      movieMap[movieId].scheduleCount++;
+      movieMap[movieId].totalTicketsSold += ticketsSold;
+      movieMap[movieId].totalRevenue += parseFloat(revResult.revenue) || 0;
+    }
+
+    return Object.values(movieMap);
+  }
+
   async generateDailyReport(cinemaId, reportDate, createdBy) {
     if (!reportDate) {
       const yesterday = new Date();
@@ -184,56 +394,95 @@ class ReportService {
   }
 
   async exportToExcel(query) {
-    const reports = await this.getReports(query);
-
     const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet('运营报表');
 
-    sheet.columns = [
-      { header: '日期', key: 'reportDate', width: 12 },
-      { header: '影院', key: 'cinemaName', width: 15 },
-      { header: '上座率', key: 'hallAttendance', width: 12 },
-      { header: '总票数(张)', key: 'totalTickets', width: 12 },
-      { header: '总收入(元)', key: 'totalRevenue', width: 14 },
-      { header: '卖品销售额(元)', key: 'concessionSales', width: 14 },
-      { header: '卖品销量(件)', key: 'concessionQuantity', width: 12 },
-      { header: '新增会员(人)', key: 'newMembers', width: 12 },
-      { header: '累计会员(人)', key: 'totalMembers', width: 12 }
+    const summary = await this.getSummary(query);
+    const scheduleDetail = await this.getScheduleDetail(query);
+    const hallSummary = await this.getHallSummary(query);
+    const movieSummary = await this.getMovieSummary(query);
+
+    const summarySheet = workbook.addWorksheet('汇总');
+    summarySheet.columns = [
+      { header: '指标', key: 'metric', width: 18 },
+      { header: '数值', key: 'value', width: 16 }
     ];
+    const summaryData = [
+      { metric: '场次数', value: summary.totalSchedules },
+      { metric: '总票数(张)', value: summary.totalTickets },
+      { metric: '总收入(元)', value: parseFloat(summary.totalRevenue.toFixed(2)) },
+      { metric: '卖品销售额(元)', value: parseFloat(summary.totalConcessionSales.toFixed(2)) },
+      { metric: '卖品销量(件)', value: summary.totalConcessionQuantity },
+      { metric: '平均上座率', value: (summary.avgAttendance * 100).toFixed(2) + '%' }
+    ];
+    for (const row of summaryData) {
+      summarySheet.addRow(row);
+    }
 
-    const headerRow = sheet.getRow(1);
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FF4472C4' }
-      };
-      cell.alignment = { vertical: 'middle', horizontal: 'center' };
-    });
-
-    for (const report of reports) {
-      sheet.addRow({
-        reportDate: report.reportDate,
-        cinemaName: report.Cinema ? report.Cinema.name : '',
-        hallAttendance: report.hallAttendance ? (parseFloat(report.hallAttendance) * 100).toFixed(2) + '%' : '0.00%',
-        totalTickets: report.totalTickets || 0,
-        totalRevenue: report.totalRevenue ? parseFloat(report.totalRevenue).toFixed(2) : '0.00',
-        concessionSales: report.concessionSales ? parseFloat(report.concessionSales).toFixed(2) : '0.00',
-        concessionQuantity: report.concessionQuantity || 0,
-        newMembers: report.newMembers || 0,
-        totalMembers: report.totalMembers || 0
+    const detailSheet = workbook.addWorksheet('场次明细');
+    detailSheet.columns = [
+      { header: '影院', key: 'cinemaName', width: 16 },
+      { header: '影厅', key: 'hallName', width: 10 },
+      { header: '影片', key: 'movieTitle', width: 16 },
+      { header: '开始时间', key: 'startTime', width: 18 },
+      { header: '结束时间', key: 'endTime', width: 18 },
+      { header: '容量', key: 'capacity', width: 8 },
+      { header: '售票数', key: 'ticketsSold', width: 8 },
+      { header: '上座率', key: 'attendanceRate', width: 10 },
+      { header: '票房(元)', key: 'revenue', width: 12 }
+    ];
+    for (const d of scheduleDetail) {
+      detailSheet.addRow({
+        ...d,
+        startTime: new Date(d.startTime).toLocaleString('zh-CN'),
+        endTime: new Date(d.endTime).toLocaleString('zh-CN'),
+        attendanceRate: (d.attendanceRate * 100).toFixed(2) + '%',
+        revenue: parseFloat(d.revenue.toFixed(2))
       });
     }
 
-    sheet.columns.forEach((column) => {
-      let maxLen = 0;
-      column.eachCell({ includeEmpty: true }, (cell) => {
-        const len = cell.value ? cell.value.toString().length : 0;
-        if (len > maxLen) maxLen = len;
+    const hallSheet = workbook.addWorksheet('影厅汇总');
+    hallSheet.columns = [
+      { header: '影院', key: 'cinemaName', width: 16 },
+      { header: '影厅', key: 'hallName', width: 10 },
+      { header: '类型', key: 'hallType', width: 8 },
+      { header: '容量', key: 'capacity', width: 8 },
+      { header: '场次数', key: 'scheduleCount', width: 8 },
+      { header: '售票数', key: 'totalTicketsSold', width: 8 },
+      { header: '上座率', key: 'attendanceRate', width: 10 }
+    ];
+    for (const h of hallSummary) {
+      hallSheet.addRow({
+        ...h,
+        attendanceRate: (h.attendanceRate * 100).toFixed(2) + '%'
       });
-      column.width = Math.max(maxLen + 2, 10);
-    });
+    }
+
+    const movieSheet = workbook.addWorksheet('影片汇总');
+    movieSheet.columns = [
+      { header: '影片', key: 'movieTitle', width: 18 },
+      { header: '场次数', key: 'scheduleCount', width: 8 },
+      { header: '售票数', key: 'totalTicketsSold', width: 8 },
+      { header: '票房(元)', key: 'totalRevenue', width: 12 }
+    ];
+    for (const m of movieSummary) {
+      movieSheet.addRow({
+        ...m,
+        totalRevenue: parseFloat(m.totalRevenue.toFixed(2))
+      });
+    }
+
+    for (const sheet of [summarySheet, detailSheet, hallSheet, movieSheet]) {
+      const headerRow = sheet.getRow(1);
+      headerRow.eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4472C4' }
+        };
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+      });
+    }
 
     const exportsDir = path.resolve(__dirname, '../../exports');
     if (!fs.existsSync(exportsDir)) {
@@ -247,35 +496,7 @@ class ReportService {
   }
 
   async getHallAttendanceDetail(cinemaId, date) {
-    const halls = await Hall.findAll({ where: { cinemaId } });
-    const result = [];
-
-    for (const hall of halls) {
-      const startOfDay = new Date(date + 'T00:00:00');
-      const endOfDay = new Date(date + 'T23:59:59.999');
-
-      const schedules = await Schedule.findAll({
-        where: { hallId: hall.id, startTime: { [Op.between]: [startOfDay, endOfDay] } },
-        include: [{ model: Movie }]
-      });
-
-      const scheduleDetails = [];
-      for (const schedule of schedules) {
-        const ticketsSold = await this._countTicketsForSchedule(schedule.id);
-        const capacity = hall.capacity;
-        scheduleDetails.push({
-          schedule,
-          movieTitle: schedule.Movie ? schedule.Movie.title : '',
-          ticketsSold,
-          capacity,
-          attendanceRate: capacity > 0 ? ticketsSold / capacity : 0
-        });
-      }
-
-      result.push({ hall, schedules: scheduleDetails });
-    }
-
-    return result;
+    return this.getHallSummary({ cinemaId, startDate: date, endDate: date });
   }
 
   async getDashboardSummary(cinemaId) {

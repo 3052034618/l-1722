@@ -4,9 +4,29 @@ const NotificationService = require('../services/NotificationService');
 
 router.get('/', async (req, res) => {
   try {
-    const { userId, page, pageSize, isRead, type } = req.query;
-    const result = await NotificationService.getNotifications(userId, { page, pageSize, isRead, type });
+    const { userId, page, pageSize, isRead, type, startDate, endDate } = req.query;
+    const result = await NotificationService.getNotifications(userId, { page, pageSize, isRead, type, startDate, endDate });
     res.json({ code: 200, message: '获取通知列表成功', data: result });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.get('/admin-overview', async (req, res) => {
+  try {
+    const { page, pageSize, isRead, type, startDate, endDate } = req.query;
+    const result = await NotificationService.getAdminOverview({ page, pageSize, isRead, type, startDate, endDate });
+    res.json({ code: 200, message: '获取全站通知概览成功', data: result });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.get('/member/:userId', async (req, res) => {
+  try {
+    const { page, pageSize, isRead, type, startDate, endDate } = req.query;
+    const result = await NotificationService.getMemberNotifications(req.params.userId, { page, pageSize, isRead, type, startDate, endDate });
+    res.json({ code: 200, message: '获取会员通知成功', data: result });
   } catch (err) {
     res.status(500).json({ code: 500, message: err.message, data: null });
   }

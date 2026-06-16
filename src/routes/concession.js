@@ -59,6 +59,16 @@ router.put('/restock-requests/:id/reject', async (req, res) => {
   }
 });
 
+router.put('/restock-requests/:id/start-purchase', async (req, res) => {
+  try {
+    const { purchasedBy } = req.body;
+    const result = await InventoryService.startPurchase(req.params.id, purchasedBy);
+    res.json({ code: 200, message: '采购已开始', data: result });
+  } catch (err) {
+    res.status(400).json({ code: 400, message: err.message, data: null });
+  }
+});
+
 router.put('/restock-requests/:id/purchase', async (req, res) => {
   try {
     const { quantity } = req.body;

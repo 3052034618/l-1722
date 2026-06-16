@@ -22,6 +22,42 @@ router.get('/', async (req, res) => {
   }
 });
 
+router.get('/summary', async (req, res) => {
+  try {
+    const result = await ReportService.getSummary(req.query);
+    res.json({ code: 200, message: '获取汇总数据成功', data: result });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.get('/schedule-detail', async (req, res) => {
+  try {
+    const result = await ReportService.getScheduleDetail(req.query);
+    res.json({ code: 200, message: '获取场次明细成功', data: result });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.get('/hall-summary', async (req, res) => {
+  try {
+    const result = await ReportService.getHallSummary(req.query);
+    res.json({ code: 200, message: '获取影厅汇总成功', data: result });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
+router.get('/movie-summary', async (req, res) => {
+  try {
+    const result = await ReportService.getMovieSummary(req.query);
+    res.json({ code: 200, message: '获取影片汇总成功', data: result });
+  } catch (err) {
+    res.status(500).json({ code: 500, message: err.message, data: null });
+  }
+});
+
 router.get('/export', async (req, res) => {
   try {
     const filePath = await ReportService.exportToExcel(req.query);

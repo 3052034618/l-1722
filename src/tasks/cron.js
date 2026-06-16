@@ -2,7 +2,7 @@ const cron = require('node-cron');
 const ReportService = require('../services/ReportService');
 const SeatLockService = require('../services/SeatLockService');
 const InventoryService = require('../services/InventoryService');
-const { User } = require('../models');
+const OrderService = require('../services/OrderService');
 
 const scheduledTasks = [];
 
@@ -20,12 +20,16 @@ function startCronJobs() {
 
   const seatLockTask = cron.schedule('* * * * *', async () => {
     try {
-      const count = await SeatLockService.releaseExpiredLocks();
-      if (count > 0) {
-        console.log(`已释放 ${count} 个超时座位锁`);
+      const lockCount = await SeatLockService.releaseExpiredLocks();
+      if (lockCount > 0) {
+        console.log(`已释放 ${lockCount} 个超时座位锁`);
+      }
+      const orderCount = await OrderService.cancelExpiredOrders();
+      if (orderCount > 0) {
+        console.log(`已自动取消 ${orderCount} 个超时未支付订单`);
       }
     } catch (err) {
-      console.error('座位锁释放失败:', err);
+      console.error('座位锁释放/订单超时取消失败:', err);
     }
   });
   scheduledTasks.push(seatLockTask);

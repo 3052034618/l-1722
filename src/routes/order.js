@@ -4,7 +4,7 @@ const SeatLockService = require('../services/SeatLockService');
 const MemberService = require('../services/MemberService');
 const InventoryService = require('../services/InventoryService');
 const NotificationService = require('../services/NotificationService');
-const { Order, OrderItem, Schedule, Concession, Member } = require('../models');
+const { Order, OrderItem, Schedule, Concession, Member, SeatLock } = require('../models');
 const { v4: uuidv4 } = require('uuid');
 
 router.post('/', async (req, res) => {
@@ -13,6 +13,11 @@ router.post('/', async (req, res) => {
 
     if (!seatIds || seatIds.length === 0) {
       return res.status(400).json({ code: 400, message: '请选择座位', data: null });
+    }
+
+    const uniqueSeatIds = [...new Set(seatIds)];
+    if (uniqueSeatIds.length !== seatIds.length) {
+      return res.status(400).json({ code: 400, message: '提交的座位存在重复，请重新选择', data: null });
     }
 
     const schedule = await Schedule.findByPk(scheduleId);
@@ -24,26 +29,30 @@ router.post('/', async (req, res) => {
     }
 
     const userActiveLocks = await SeatLockService.getUserActiveLocks(scheduleId, userId);
-    const userActiveSeatIds = userActiveLocks.map(l => l.seatId);
-
     if (userActiveLocks.length === 0) {
       return res.status(400).json({ code: 400, message: '您的座位锁定已过期，请重新选座', data: null });
     }
 
-    const invalidSeatIds = seatIds.filter(id => !userActiveSeatIds.includes(id));
-    if (invalidSeatIds.length > 0) {
+    const userActiveSeatIds = userActiveLocks.map(l => l.seatId);
+
+    const extraSeatIds = uniqueSeatIds.filter(id => !userActiveSeatIds.includes(id));
+    if (extraSeatIds.length > 0) {
       return res.status(400).json({
         code: 400,
-        message: `座位 ${invalidSeatIds.join(', ')} 未被您锁定或已过期`,
+        message: `座位 ${extraSeatIds.join(', ')} 未被您锁定或已过期，请重新选座`,
         data: null
       });
     }
 
-    if (seatIds.length !== userActiveLocks.filter(l => seatIds.includes(l.seatId)).length) {
-      return res.status(400).json({ code: 400, message: '锁定座位数量与下单座位数量不一致', data: null });
+    if (uniqueSeatIds.length !== userActiveLocks.length) {
+      return res.status(400).json({
+        code: 400,
+        message: `您锁定了 ${userActiveLocks.length} 个座位，但只提交了 ${uniqueSeatIds.length} 个，请一并结算所有锁定座位`,
+        data: { lockedCount: userActiveLocks.length, submittedCount: uniqueSeatIds.length }
+      });
     }
 
-    const ticketTotal = seatIds.length * schedule.price;
+    const ticketTotal = uniqueSeatIds.length * schedule.price;
     let concessionTotal = 0;
     const concessionDetails = [];
 
@@ -80,7 +89,21 @@ router.post('/', async (req, res) => {
     }
 
     const payAmount = Math.max(discountedAmount - pointsDeduction, 0);
+
+    const confirmedLocks = await SeatLockService.confirmLocks(scheduleId, uniqueSeatIds, userId);
+    if (confirmedLocks.length !== uniqueSeatIds.length) {
+      for (const lock of confirmedLocks) {
+        await lock.update({ status: 'locked' });
+      }
+      return res.status(400).json({
+        code: 400,
+        message: '部分座位锁已失效，请重新选座',
+        data: null
+      });
+    }
+
     const orderId = uuidv4();
+    const earliestExpireAt = userActiveLocks.reduce((min, l) => l.expireAt < min ? l.expireAt : min, userActiveLocks[0].expireAt);
 
     const order = await Order.create({
       id: orderId,
@@ -90,10 +113,11 @@ router.post('/', async (req, res) => {
       discountAmount: totalAmount - discountedAmount,
       payAmount,
       pointsUsed: pointsToUse,
-      status: 'pending'
+      status: 'pending',
+      expireAt: earliestExpireAt
     });
 
-    for (const seatId of seatIds) {
+    for (const seatId of uniqueSeatIds) {
       await OrderItem.create({
         orderId,
         itemType: 'ticket',
@@ -115,16 +139,6 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const confirmedLocks = await SeatLockService.confirmLocks(scheduleId, seatIds, userId);
-    if (confirmedLocks.length !== seatIds.length) {
-      await order.update({ status: 'cancelled' });
-      return res.status(400).json({
-        code: 400,
-        message: '部分座位锁已失效，订单已取消，请重新选座',
-        data: null
-      });
-    }
-
     let pointsEarned = 0;
     if (memberRecord) {
       const earnResult = await MemberService.earnPoints(memberRecord.id, payAmount, 'order', orderId);
@@ -139,7 +153,7 @@ router.post('/', async (req, res) => {
     await NotificationService.notifyUser(userId, {
       type: 'order_created',
       title: '订单创建成功',
-      content: `您的订单 ${orderId} 已创建，待支付金额：${payAmount}元，请在座位锁定到期前完成支付`
+      content: `您的订单 ${orderId} 已创建，待支付金额：${payAmount}元，请在 ${new Date(earliestExpireAt).toLocaleTimeString('zh-CN')} 前完成支付`
     });
 
     await NotificationService.notifySellers({
@@ -192,9 +206,9 @@ router.put('/:id/pay', async (req, res) => {
     if (order.status === 'cancelled') {
       return res.status(400).json({ code: 400, message: '订单已取消，无法支付', data: null });
     }
+
     const ticketItems = order.OrderItems.filter(item => item.itemType === 'ticket');
     const seatIds = ticketItems.map(item => item.itemId);
-    const { SeatLock } = require('../models');
     const seatLocks = await SeatLock.findAll({
       where: { scheduleId: order.scheduleId, seatId: seatIds, status: 'paid' }
     });

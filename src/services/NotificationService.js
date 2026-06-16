@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const config = require('../config/index');
-const { Notification, User } = require('../models');
+const { Notification, User, Op } = require('../models');
 
 class NotificationService {
   initialize(io) {
@@ -126,26 +126,127 @@ class NotificationService {
   }
 
   async getNotifications(userId, query = {}) {
-    const { page = 1, pageSize = 10, isRead, type } = query;
+    const { page = 1, pageSize = 10, isRead, type, startDate, endDate } = query;
     const where = { userId };
-    if (isRead !== undefined) {
-      where.isRead = isRead;
+
+    if (isRead !== undefined && isRead !== '') {
+      where.isRead = isRead === 'true' || isRead === true;
     }
     if (type) {
       where.type = type;
     }
+    if (startDate || endDate) {
+      where.createdAt = where.createdAt || {};
+      if (startDate) {
+        where.createdAt[Op.gte] = new Date(startDate + 'T00:00:00');
+      }
+      if (endDate) {
+        where.createdAt[Op.lte] = new Date(endDate + 'T23:59:59.999');
+      }
+    }
+
     const offset = (page - 1) * pageSize;
     const { count, rows } = await Notification.findAndCountAll({
       where,
-      limit: pageSize,
+      limit: parseInt(pageSize, 10),
       offset,
       order: [['createdAt', 'DESC']],
     });
     return {
       total: count,
-      page,
-      pageSize,
+      page: parseInt(page, 10),
+      pageSize: parseInt(pageSize, 10),
       totalPages: Math.ceil(count / pageSize),
+      notifications: rows,
+    };
+  }
+
+  async getAdminOverview(query = {}) {
+    const { type, startDate, endDate, isRead, page = 1, pageSize = 20 } = query;
+    const where = {};
+
+    if (isRead !== undefined && isRead !== '') {
+      where.isRead = isRead === 'true' || isRead === true;
+    }
+    if (type) {
+      where.type = type;
+    }
+    if (startDate || endDate) {
+      where.createdAt = where.createdAt || {};
+      if (startDate) {
+        where.createdAt[Op.gte] = new Date(startDate + 'T00:00:00');
+      }
+      if (endDate) {
+        where.createdAt[Op.lte] = new Date(endDate + 'T23:59:59.999');
+      }
+    }
+
+    const offset = (page - 1) * pageSize;
+    const { count, rows } = await Notification.findAndCountAll({
+      where,
+      limit: parseInt(pageSize, 10),
+      offset,
+      order: [['createdAt', 'DESC']],
+      include: [{ model: User, attributes: ['id', 'username', 'role', 'name'] }]
+    });
+
+    const totalUnread = await Notification.count({ where: { ...where, isRead: false } });
+
+    return {
+      total: count,
+      page: parseInt(page, 10),
+      pageSize: parseInt(pageSize, 10),
+      totalPages: Math.ceil(count / pageSize),
+      totalUnread,
+      notifications: rows,
+    };
+  }
+
+  async getMemberNotifications(userId, query = {}) {
+    const memberTypes = [
+      'order_created', 'order_paid', 'order_cancelled', 'order_timeout_cancelled',
+      'seat_lock_expired', 'schedule_updated', 'schedule_cancelled',
+      'restock_approved', 'restock_rejected', 'restock_completed',
+      'points_earned', 'points_redeemed'
+    ];
+
+    const { page = 1, pageSize = 10, isRead, type, startDate, endDate } = query;
+    const where = { userId, type: { [Op.in]: memberTypes } };
+
+    if (isRead !== undefined && isRead !== '') {
+      where.isRead = isRead === 'true' || isRead === true;
+    }
+    if (type) {
+      where.type = type;
+    }
+    if (startDate || endDate) {
+      where.createdAt = where.createdAt || {};
+      if (startDate) {
+        where.createdAt[Op.gte] = new Date(startDate + 'T00:00:00');
+      }
+      if (endDate) {
+        where.createdAt[Op.lte] = new Date(endDate + 'T23:59:59.999');
+      }
+    }
+
+    const offset = (page - 1) * pageSize;
+    const { count, rows } = await Notification.findAndCountAll({
+      where,
+      limit: parseInt(pageSize, 10),
+      offset,
+      order: [['createdAt', 'DESC']],
+    });
+
+    const totalUnread = await Notification.count({
+      where: { userId, type: { [Op.in]: memberTypes }, isRead: false }
+    });
+
+    return {
+      total: count,
+      page: parseInt(page, 10),
+      pageSize: parseInt(pageSize, 10),
+      totalPages: Math.ceil(count / pageSize),
+      totalUnread,
       notifications: rows,
     };
   }
